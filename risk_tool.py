@@ -2,7 +2,9 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
-from scipy.stats import norm, chi2
+from scipy.stats import norm, chi2, probplot
+from scipy.special import xlogy
+
 from matplotlib.colors import LinearSegmentedColormap
 
 WEIGHT_COLOR = "#2a78d6"   # blue
@@ -60,10 +62,11 @@ def check_history(prices, window=500, min_test_days=750):
 
     return usable
 
+"""Returns are computed as percentages, with formula (Price_t - Price_t-1)/Price_t-1"""
 def compute_returns(prices):
-    """Daily returns for each asset, with missing rows dropped."""
     return prices.pct_change().dropna()
-    
+
+
 
 
 def portfolio_returns(returns, w):
@@ -86,6 +89,8 @@ def risk_shares(returns, w):
     """
     Each asset's share of total portfolio variance.
 
+    This is the beginning of the lin alg process
+
     returns: DataFrame of daily asset returns (rows = dates, columns = tickers).
     w:       Series of weights, indexed by ticker, summing to 1.
 
@@ -96,6 +101,23 @@ def risk_shares(returns, w):
     contrib = w * (cov @ w)               # w_i × (Σw)_i, one per asset
     return pd.DataFrame({"weight": w, "risk_share": contrib / port_var})
 
+def plot_return_histograms(returns, limit=0.05, bins=80):
+    """One histogram of daily returns per asset, all on the same axes."""
+    edges = np.linspace(-limit, limit, bins + 1)
+    n = len(returns.columns)
+    fig, axes = plt.subplots(1, n, figsize=(3.2 * n, 3.5), sharex=True, sharey=True)
+
+    for ax, ticker in zip(axes, returns.columns):
+        r = returns[ticker]
+        ax.hist(r, bins=edges, color=WEIGHT_COLOR, alpha=0.85)
+        ax.set_title(f"{ticker}\nsd = {r.std():.2%} a day", fontsize=11)
+        for side in ["top", "right"]:
+            ax.spines[side].set_visible(False)
+
+    axes[0].set_ylabel("Number of days")
+    fig.suptitle("Daily returns by asset", x=0.01, ha="left", fontsize=13)
+    plt.tight_layout()
+    plt.show()
 
 def plot_risk_shares(shares):
     """Side-by-side bar chart: weight vs. risk share for each asset."""
@@ -136,7 +158,7 @@ def plot_risk_shares(shares):
 
 
 def plot_correlations(returns):
-    """Heatmap of the correlation matrix (which assets move together)."""
+    """Heatmap of the correlation matrix."""
     corr = returns.corr()
     cmap = LinearSegmentedColormap.from_list(
         "blue_gray_red", ["#2a78d6", "#f0efec", "#e34948"]
@@ -164,7 +186,7 @@ def plot_correlations(returns):
 
 def pca_concentration(returns):
     """
-    PCA via eigen-decomposition of the correlation matrix.
+    PCA via eigen-decomposition of the correlation matrix. As outlined in lectures
 
     returns: DataFrame of daily asset returns (rows = dates, columns = tickers).
 
@@ -193,51 +215,89 @@ def pca_concentration(returns):
 
 
 # =====================================================================
-# 3. LOSS
+# 3. LOSS 
 # =====================================================================
 
 def var_historical(port, level=0.95):
-    """Historical VaR: the (1 - level) quantile of past returns."""
-    # TODO
-    raise NotImplementedError
+    """
+    Historical VaR: the (1 - level) quantile of past returns.
+    e.g. level=0.95 -> the 5th percentile. Returned as a (negative) return.
+    """
+    return port.quantile(1 - level)
 
 
 def var_parametric(port, level=0.95):
-    """Normal VaR: mean + z * sd, where z = norm.ppf(1 - level)."""
-    # TODO
-    raise NotImplementedError
+    """
+    Normal (parametric) VaR: mean + z * sd, where z = norm.ppf(1 - level).
+    e.g. level=0.95 -> z = -1.645. Returned as a (negative) return.
+    """
+    z = norm.ppf(1 - level)
+    return port.mean() + z * port.std()
 
 
-def expected_shortfall(port, level=0.95):
-    """Average return on the days worse than historical VaR."""
-    # TODO: var = var_historical(port, level); return port[port <= var].mean()
-    raise NotImplementedError
-
+def expected_shortfall(port, level=0.95): # also known as CVaR
+    """
+    Expected Shortfall is the average return on the days
+    that were worse than historical VaR. "When a bad day happens,
+    how bad is it on average?" gives us more insight onto the losses
+    """
+    var = var_historical(port, level)
+    return port[port <= var].mean()
 
 def worst_day(port):
     """Largest one-day loss in the data and the date it happened."""
-    # TODO: return port.min(), port.idxmin()
-    raise NotImplementedError
+    return port.min(), port.idxmin()
 
 
 def loss_table(port, portfolio_value=1_000_000):
     """
-    Summary table of loss measures at 95% and 99%, as returns and dollars.
-    Rows: Historical VaR, Parametric VaR, Expected Shortfall.
+    Summary of loss measures at 95% and 99%.
+
+    Returns a DataFrame with rows = measures and columns:
+      "95%", "99%"                 -> daily return (negative = loss)
+      "95% loss ($)", "99% loss ($)" -> the same loss in dollars (positive)
     """
-    # TODO: build a DataFrame from the functions above
-    # TODO: add dollar columns = return * portfolio_value
-    raise NotImplementedError
+    rows = {}
+    for name, func in [("Historical VaR", var_historical),
+                       ("Parametric VaR", var_parametric),
+                       ("Expected Shortfall", expected_shortfall)]:
+        rows[name] = {f"{int(lvl * 100)}%": func(port, lvl) for lvl in (0.95, 0.99)}
+
+    table = pd.DataFrame(rows).T
+    for col in ["95%", "99%"]:
+        table[f"{col} loss ($)"] = (-table[col] * portfolio_value).round(0)
+    return table
 
 
 def qq_plot(port):
-    """QQ plot of portfolio returns vs. a normal distribution."""
-    # TODO: import statsmodels.api as sm; sm.qqplot(port, line="s"); plt.show()
-    raise NotImplementedError
+    """
+    QQ plot of standardized portfolio returns vs. a normal distribution.
+    Points on the line = normal. Points bending away at the ends = fat tails.
+    """
+    z = (port - port.mean()) / port.std()
+    (theoretical, sample), _ = probplot(z, dist="norm")
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.scatter(theoretical, sample, s=6, color=WEIGHT_COLOR, alpha=0.5, edgecolor="none")
+    lim = max(abs(sample).max(), abs(theoretical).max()) * 1.05
+    ax.plot([-lim, lim], [-lim, lim], color=TEXT_MUTED, linewidth=1, label="Normal distribution")
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_aspect("equal")
+    ax.set_xlabel("Normal quantiles (standard deviations)")
+    ax.set_ylabel("Portfolio return quantiles (standard deviations)")
+    ax.set_title("QQ plot: portfolio returns vs. normal", loc="left", fontsize=13)
+    ax.legend(frameon=False, loc="upper left")
+    ax.grid(color="#e5e4e0", linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ["top", "right"]:
+        ax.spines[side].set_visible(False)
+    plt.tight_layout()
+    plt.show()
 
 
 # =====================================================================
-# 4. BACKTEST... can we trust the VaR?
+# 4. BACKTEST - can we trust the VaR?
 # =====================================================================
 
 def rolling_var(port, method="historical", level=0.95, window=500):
@@ -249,49 +309,84 @@ def rolling_var(port, method="historical", level=0.95, window=500):
     VaR would use that same day's return (look-ahead bias).
     """
     alpha = 1 - level
-    # TODO historical: port.rolling(window).quantile(alpha)
-    # TODO parametric: rolling mean + norm.ppf(alpha) * rolling std
-    # TODO: return result.shift(1)
-    raise NotImplementedError
+    rolling = port.rolling(window) # a rolling object
+    if method == "historical":
+        result = rolling.quantile(alpha)
+    elif method == "parametric":
+        result = rolling.mean() + norm.ppf(alpha) * rolling.std()
+    else:
+        raise ValueError('method must be "historical" or "parametric"')
+    return result.shift(1) 
+    # shifts results because of window being pushed by a day,
+    # so a day 4 would use day 1-3 instead of day 3 using day 1-3
 
 
-def exceedances(port, var_series):
+def exceeds(port, var_series):
     """
     True on days the return was worse than that day's VaR.
-    Only count days where a VaR exists (drop the NaN warm-up period).
+    Only counts days where a VaR exists (drops the warm-up period).
     """
-    # TODO: valid = var_series.notna()
-    # TODO: return (port < var_series)[valid]
-    raise NotImplementedError
+    valid = var_series.notna() # removes the NaN's from previous 500
+    return (port < var_series)[valid]
 
 
 def kupiec_test(exceed, level=0.95):
     """
-    Likelihood ratio test: is the exceedance rate equal to 1 - level?
+    Kupiec (1995) likelihood ratio test: is the exceedance rate equal to 1 - level?
 
-    H0: p = 1 - level.   Alternative: p = observed rate x / T.
-    LR = -2 * (loglik_H0 - loglik_alt) ~ chi-squared(1).
+    Each day is a Bernoulli trial (breach or not).
+    H0: p = 1 - level.   Alternative: p = observed rate x / T (the MLE).
+    LR = -2 * (loglik_H0 - loglik_alt) ~ chi-squared(1) under H0.
 
-    Returns: dict with x, T, expected, observed_rate, LR, p_value.
-    Watch out: if x == 0, log(p_hat) breaks - handle that case.
+    xlogy(a, b) computes a*log(b) but returns 0 when a == 0, which handles
+    the x == 0 and x == T edge cases without log(0) errors.
     """
-    # TODO: x = exceed.sum(); T = len(exceed); p = 1 - level; p_hat = x / T
+     # TODO: x = exceed.sum(); T = len(exceed); p = 1 - level; p_hat = x / T
     # TODO: log-likelihoods, LR, p_value = 1 - chi2.cdf(LR, df=1)
     raise NotImplementedError
 
 
+def exceedances_by_year(exceed, level=0.95):
+    """Breaches per calendar year vs. the number expected - shows whether they cluster."""
+    by_year = exceed.groupby(exceed.index.year).agg(["sum", "count"])
+    by_year.columns = ["breaches", "days"]
+    by_year["expected"] = (by_year["days"] * (1 - level)).round(1)
+    by_year["rate"] = (by_year["breaches"] / by_year["days"]).round(3)
+    by_year.index.name = "year"
+    return by_year
+
+
 def plot_backtest(port, var_series, exceed, title="VaR backtest"):
-    """Returns over time, VaR line on top, exceedances marked in red."""
-    # TODO: plot port (thin grey), var_series (line), exceedance days (red dots)
-    raise NotImplementedError
+    """Daily returns (grey), the VaR line (blue), and breach days (red dots)."""
+    valid = var_series.notna()
+    r = port[valid]
+    v = var_series[valid]
+    breach_days = exceed[exceed].index
+
+    fig, ax = plt.subplots(figsize=(11, 4.5))
+    ax.plot(r.index, r, color="#b4b2a9", linewidth=0.6, label="Daily return")
+    ax.plot(v.index, v, color=WEIGHT_COLOR, linewidth=1.5, label="VaR")
+    ax.scatter(breach_days, r[breach_days], color="#e34948", s=12, zorder=3,
+               label=f"Breach ({len(breach_days)} of {len(exceed)} days)")
+    ax.axhline(0, color=TEXT_MUTED, linewidth=0.8)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.1%}"))
+    ax.set_title(title, loc="left", fontsize=13)
+    ax.set_ylabel("Daily portfolio return")
+    ax.legend(frameon=False, loc="lower left")
+    ax.grid(axis="y", color="#e5e4e0", linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ["top", "right"]:
+        ax.spines[side].set_visible(False)
+    plt.tight_layout()
+    plt.show()
 
 
 # =====================================================================
-# 5. Reporting
+# 5. THE REPORT - one call does everything
 # =====================================================================
 
 def risk_report(tickers, weights, start="2012-01-01",
-                portfolio_value=1_000_000, window=500):
+                portfolio_value=1_000_000, window=500, level=0.95):
     """
     Full risk report for any long-only portfolio.
     Returns a dict of results so the notebook can reuse them.
@@ -309,7 +404,7 @@ def risk_report(tickers, weights, start="2012-01-01",
     shares = risk_shares(returns, w)
     explained, loadings = pca_concentration(returns[w.index])
     print("\n== Where the risk comes from ==")
-    print(shares)
+    print(shares.round(3))
     print(f"First principal component explains {explained.iloc[0]:.1%} of total variation")
     plot_risk_shares(shares)
     plot_correlations(returns[w.index])
@@ -318,20 +413,21 @@ def risk_report(tickers, weights, start="2012-01-01",
     table = loss_table(port, portfolio_value)
     worst, worst_date = worst_day(port)
     print("\n== How much could we lose ==")
-    print(table)
+    print(table.round(4))
     print(f"Worst day: {worst:.2%} on {worst_date.date()}")
     qq_plot(port)
 
-    # 4. Backtest (95%, both methods)
+    # 4. Backtest (both methods)
     backtests = {}
-    print("\n== Can we trust the VaR ==")
+    print(f"\n== Can we trust the VaR ({level:.0%}, {window}-day window) ==")
     for method in ["historical", "parametric"]:
-        var_series = rolling_var(port, method=method, level=0.95, window=window)
-        exceed = exceedances(port, var_series)
-        result = kupiec_test(exceed, level=0.95)
-        backtests[method] = result
+        var_series = rolling_var(port, method=method, level=level, window=window)
+        exceed = exceed(port, var_series)
+        result = kupiec_test(exceed, level=level)
+        backtests[method] = {"var": var_series, "exceed": exceed, "kupiec": result}
         print(f"{method}: {result}")
-        plot_backtest(port, var_series, exceed, title=f"{method.title()} VaR backtest")
+        plot_backtest(port, var_series, exceed,
+                      title=f"{method.title()} VaR backtest ({level:.0%}, {window}-day window)")
 
     return {
         "returns": returns,
@@ -346,7 +442,6 @@ def risk_report(tickers, weights, start="2012-01-01",
 
 
 if __name__ == "__main__":
-    # Example: the six-asset portfolio
-    tickers = ["SPY", "EFA", "IEF", "GLD", "XLE", "XME"]
-    weights = [0.30, 0.15, 0.25, 0.10, 0.10, 0.10]
+    tickers = ["SPY", "EFA", "IEF", "GLD"]
+    weights = [0.50, 0.25, 0.15, 0.10]
     risk_report(tickers, weights)
